@@ -1,0 +1,15 @@
+# secrets
+.env
+.env.*
+*.session
+*.session-journal
+
+# python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# runtime files
+upload_done.txt
+web_tmp/

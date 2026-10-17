@@ -1,0 +1,5 @@
+telethon
+cryptg
+hachoir
+fastapi
+uvicorn
