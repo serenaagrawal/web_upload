@@ -232,6 +232,39 @@ def _gemini_call(filename: str, thumb, model: str) -> dict:
     return json.loads(res["candidates"][0]["content"]["parts"][0]["text"])
 
 
+def _list_models() -> list:
+    """names of Gemini models this key can use for generateContent"""
+    req = urllib.request.Request(
+        "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
+        headers={"x-goog-api-key": GEMINI_KEY})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.load(r)
+    return [m["name"].split("/", 1)[1] for m in data.get("models", [])
+            if "generateContent" in m.get("supportedGenerationMethods", [])]
+
+
+async def check_gemini():
+    """runs once at startup: prints usable models and fixes GEMINI_MODELS if needed"""
+    if not GEMINI_KEY:
+        return
+    try:
+        names = await asyncio.to_thread(_list_models)
+    except Exception as ex:
+        print(f"Gemini check failed (key wrong or no access?): {ex}", flush=True)
+        return
+    flash = [n for n in names if "flash" in n]
+    print("Gemini flash models available:", ", ".join(flash) or "none", flush=True)
+    ok = [m for m in GEMINI_MODELS if m in names]
+    if not ok:
+        skip = ("tts", "live", "image", "lite", "audio", "embedding", "exp", "robotics")
+        ok = [n for n in flash if not any(s in n for s in skip)][:3]
+    if ok:
+        GEMINI_MODELS[:] = ok
+        print("Using Gemini model:", GEMINI_MODELS[0], flush=True)
+    else:
+        print("No usable Gemini model found, captions will use the file name only.", flush=True)
+
+
 async def ai_meta(filename: str, thumb) -> dict:
     if not GEMINI_KEY:
         return {}
@@ -556,6 +589,8 @@ async def main():
         await client.disconnect()
         sys.exit(1)
     print("Channel found.", flush=True)
+
+    await check_gemini()
 
     STATE.update(client=client, target=target, token=key, queue=asyncio.Queue())
     asyncio.create_task(worker())
