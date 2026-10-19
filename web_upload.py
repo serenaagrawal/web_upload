@@ -14,7 +14,7 @@
 #
 # Big files are sent from the browser in 16 MB pieces, so Railway's per-request
 # time limit does not break large uploads.
-import asyncio, base64, html, json, os, re, secrets, shutil, sys, urllib.request, uuid
+import asyncio, base64, html, json, os, re, secrets, shutil, sys, urllib.error, urllib.request, uuid
 from pathlib import Path
 
 import uvicorn
@@ -35,7 +35,11 @@ WAIT_FOR_POST = 300            # seconds to wait for a test post if the channel 
 MAX_BYTES = 2000 * 1024 * 1024 # Telegram limit for bots is about 2 GB
 
 GEMINI_KEY   = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+# tried in this order; the first one that works is remembered. GEMINI_MODEL (optional) goes first.
+GEMINI_MODELS = list(dict.fromkeys(m for m in [
+    os.environ.get("GEMINI_MODEL", "").strip(),
+    "gemini-flash-latest", "gemini-3.5-flash", "gemini-2.5-flash",
+] if m))
 
 DEFAULTS = {
     "title": None, "year": None, "ep": None, "language": None,
@@ -200,7 +204,7 @@ async def make_thumb(p: Path, duration: int):
     return thumb if rc == 0 and thumb.exists() else None
 
 
-def _gemini_call(filename: str, thumb) -> dict:
+def _gemini_call(filename: str, thumb, model: str) -> dict:
     prompt = (
         "You write info for a Telegram movie channel post.\n"
         f"File name: {filename}\n"
@@ -220,7 +224,7 @@ def _gemini_call(filename: str, thumb) -> dict:
     body = {"contents": [{"parts": parts}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0.7}}
     req = urllib.request.Request(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_KEY})
     with urllib.request.urlopen(req, timeout=60) as r:
@@ -231,9 +235,9 @@ def _gemini_call(filename: str, thumb) -> dict:
 async def ai_meta(filename: str, thumb) -> dict:
     if not GEMINI_KEY:
         return {}
-    for attempt in range(2):                      # one retry, then give up
+    for model in list(GEMINI_MODELS):             # next model if one is missing/overloaded
         try:
-            j = await asyncio.to_thread(_gemini_call, filename, thumb)
+            j = await asyncio.to_thread(_gemini_call, filename, thumb, model)
             out = {}
             for k in ("title", "year", "studio", "description"):
                 v = str(j.get(k) or "").strip()
@@ -242,10 +246,16 @@ async def ai_meta(filename: str, thumb) -> dict:
             desc = out.get("description", "")
             if len(desc) > 130:                   # keep it short even if the AI writes more
                 out["description"] = desc[:127].rsplit(" ", 1)[0].rstrip(" ,;:.") + "…"
+            if GEMINI_MODELS[0] != model:         # remember the model that works
+                GEMINI_MODELS.remove(model)
+                GEMINI_MODELS.insert(0, model)
             return out
+        except urllib.error.HTTPError as ex:
+            body = ex.read().decode(errors="ignore")[:200]
+            print(f"AI caption failed for {filename} (model {model}): HTTP {ex.code} {body}", flush=True)
         except Exception as ex:
-            print(f"AI caption failed for {filename} (try {attempt + 1}/2): {ex}", flush=True)
-            await asyncio.sleep(2)
+            print(f"AI caption failed for {filename} (model {model}): {ex}", flush=True)
+        await asyncio.sleep(1)
     return {}      # AI failed: post with file name info only (title, type, runtime, size, channels)
 
 
