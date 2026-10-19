@@ -1,18 +1,20 @@
 # web_upload.py  (Railway version)
 #
 # Environment variables (set them in Railway > Variables):
-#   API_ID       Telegram API ID
-#   API_HASH     Telegram API hash
-#   BOT_TOKEN    bot token from @BotFather
-#   CHANNEL_ID   -1001234567890  (or @channelusername)
-#   KEY          secret password for the web page (choose a long random text)
-#   PORT         set by Railway automatically
+#   API_ID          Telegram API ID
+#   API_HASH        Telegram API hash
+#   BOT_TOKEN       bot token from @BotFather
+#   CHANNEL_ID      -1001234567890  (or @channelusername)
+#   KEY             secret password for the web page (choose a long random text)
+#   GEMINI_API_KEY  free key from https://aistudio.google.com/apikey  (AI title/studio/description)
+#   NIXPACKS_PKGS   ffmpeg   (installs ffmpeg + ffprobe for thumbnails)
+#   PORT            set by Railway automatically
 #
 # Open:  https://<your-railway-domain>/?key=<KEY>
 #
 # Big files are sent from the browser in 16 MB pieces, so Railway's per-request
 # time limit does not break large uploads.
-import asyncio, html, json, os, re, secrets, shutil, sys, uuid
+import asyncio, base64, html, json, os, re, secrets, shutil, sys, urllib.request, uuid
 from pathlib import Path
 
 import uvicorn
@@ -21,30 +23,25 @@ from fastapi.responses import HTMLResponse
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
+from telethon.tl.types import DocumentAttributeVideo
 
 TMP_DIR       = Path("/tmp/web_tmp")
 DONE_LOG      = Path("/tmp/upload_done.txt")
-CAPTIONS_FILE = Path("captions.json")          # optional, put it in the repo next to this file
+CAPTIONS_FILE = Path("captions.json")          # optional manual overrides, next to this file
 EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
 PORT = int(os.environ.get("PORT", "8000"))
 DELAY = 3                      # seconds between Telegram uploads
 WAIT_FOR_POST = 300            # seconds to wait for a test post if the channel is not known yet
 MAX_BYTES = 2000 * 1024 * 1024 # Telegram limit for bots is about 2 GB
 
+GEMINI_KEY   = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
 DEFAULTS = {
-    "title": None, "year": None, "tagline": "", "quality": None, "language": None,
-    "ep": None, "rating": "", "stars": "", "director": "",
-    "channels": ["🇵🇭 @cinepopx", "🔥 @movies_hub"],
-    "links": [
-        ["Server 1", "https://1024terabox.com/s/1yLKRMK9wa2terYMwerUidg"],
-        ["Server 2", "https://flezen.com/s/db4ndshbjlnnsc4fhn4gy092he6dku8"],
-        ["Server 3", "https://www.diskwala.com/app/6ac979bf2a52418b24ead8ad"],
-    ],
-    "hashtags": None,
-    "footer": "✨ Watch now in the best quality.",
+    "title": None, "year": None, "ep": None, "language": None,
+    "studio": "", "description": "",
+    "channels": ["@cinepopx", "@movies_hub"],
 }
-NUMS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣"]
-LINE = "━━━━━━━━━━━━━━━━━━━━"
 
 # ---------------------------------------------------------------- file name parsing
 RE_SEASON_EP = re.compile(r"\bS(\d{1,2})\s?E(\d{1,3})\b", re.I)
@@ -53,11 +50,6 @@ RE_YEAR      = re.compile(r"[\(\[]?\b((?:19|20)\d{2})\b[\)\]]?")
 RE_RES       = re.compile(r"\b(2160p|4K|1440p|1080p|720p|480p|360p)\b", re.I)
 RE_SOURCE    = re.compile(r"\b(WEB-?DL|WEB-?Rip|Blu-?Ray|BRRip|HDRip|HDTV|DVDRip|HEVC|x26[45]|H\.?26[45]|AAC|DDP?5\.1)\b", re.I)
 RE_LANG      = re.compile(r"\b(Hindi|English|Tagalog|Filipino|Tamil|Telugu|Bengali|Korean|Japanese|Dual Audio|Multi Audio)\b", re.I)
-
-QUALITY_LABEL = {
-    "2160p": "4K ULTRA HD", "4k": "4K ULTRA HD", "1440p": "2K QHD",
-    "1080p": "FULL HD 1080p", "720p": "HD 720p", "480p": "SD 480p", "360p": "SD 360p",
-}
 
 
 def parse_name(stem: str) -> dict:
@@ -83,7 +75,6 @@ def parse_name(stem: str) -> dict:
 
     m = RE_RES.search(s)
     if m:
-        info["quality"] = QUALITY_LABEL.get(m.group(1).lower(), m.group(1).upper())
         cuts.append(m.start())
 
     m = RE_SOURCE.search(s)
@@ -131,89 +122,131 @@ def get_duration(p: Path) -> str:
     return ""
 
 
-def make_hashtags(title: str, year: str, quality: str) -> str:
-    words = re.sub(r"[^\w\s]", "", title).split()
-    tags = ["#" + "".join(w.capitalize() for w in words)] if words else []
-    if year:
-        tags.append(f"#{year}")
-    if quality:
-        tags.append("#" + re.sub(r"\W+", "", quality.split()[0]))
-    tags += ["#FullMovie", "#WatchNow", "#MovieUpdate"]
-    return " ".join(dict.fromkeys(t for t in tags if len(t) > 1))
-
-
-def build_caption(p: Path, meta: dict) -> str:
+def build_caption(p: Path, meta: dict, runtime: str = "") -> str:
     detected = parse_name(p.stem)
     d = dict(DEFAULTS)
     d.update({k: v for k, v in detected.items() if v})
     d.update(meta)
 
     e = html.escape
-    d["quality"] = d.get("quality") or "HD"
-    d["ep"] = d.get("ep") or "FULL MOVIE"
-    d["title"] = d.get("title") or p.stem
+    title = d.get("title") or p.stem
     year = d.get("year") or ""
-    hashtags = d.get("hashtags") or make_hashtags(d["title"], year, d["quality"])
-
+    type_ = d.get("ep") or "Full Movie"
+    desc = (d.get("description") or "").strip()
+    runtime = runtime or get_duration(p)
     try:
         size = human_size(p.stat().st_size)
     except OSError:
         size = ""
-    duration = get_duration(p)
 
-    def render(drop=()):
-        title_line = f"🎬 <b>{e(d['title'].upper())}</b>" + (f" <b>({e(year)})</b>" if year else "")
-        out = ["💎 <b>PREMIUM RELEASE</b> 💎", LINE, title_line]
-        if d["tagline"] and "tagline" not in drop:
-            out.append(f"<i>{e(d['tagline'])}</i>")
-        out.append("")
-
-        info = [f"🎞 <b>Quality:</b> {e(d['quality'])}",
-                f"📺 <b>Type:</b> {e(d['ep'])}"]
-        if d.get("language"):
-            info.append(f"🎧 <b>Audio:</b> {e(d['language'])}")
-        if duration:
-            info.append(f"⏱ <b>Runtime:</b> {e(duration)}")
+    def render(desc_text):
+        out = [f"🎬 <b>{e(title)}</b>" + (f" <b>({e(year)})</b>" if year else "")]
+        if d.get("studio"):
+            out.append(f"🏢 <b>Studio:</b> {e(d['studio'])}")
+        if desc_text:
+            out.append(f"📝 <b>Description:</b> {e(desc_text)}")
+        out.append(f"📁 <b>Type:</b> {e(type_)}")
+        if runtime:
+            out.append(f"⏱ <b>Runtime:</b> {e(runtime)}")
         if size:
-            info.append(f"💾 <b>Size:</b> {e(size)}")
-        if d["rating"]:
-            info.append(f"⭐ <b>Rating:</b> {e(d['rating'])}")
-        out.extend(info)
-
-        extra = []
-        if d["stars"]:
-            extra.append(f"👥 <b>Stars:</b> {e(d['stars'])}")
-        if d["director"]:
-            extra.append(f"🎥 <b>Director:</b> {e(d['director'])}")
-        if extra:
-            out.append("")
-            out.extend(extra)
-
-        out.append("")
-        if d["links"]:
-            out.append("🔗 <b>WATCH / DOWNLOAD</b>")
-            for n, (name, url) in enumerate(d["links"][:len(NUMS)]):
-                out.append(f'{NUMS[n]} <a href="{e(url, quote=True)}">{e(name)}</a>')
-            out.append("")
-        if d["channels"]:
-            out.append("📢 <b>JOIN US</b>")
-            out.extend(e(c) for c in d["channels"])
-            out.append("")
-        out.append(LINE)
-        if "hashtags" not in drop:
-            out.append(e(hashtags))
-        if d["footer"] and "footer" not in drop:
-            out.append(f"<i>{e(d['footer'])}</i>")
+            out.append(f"💾 <b>Size:</b> {e(size)}")
+        if d.get("channels"):
+            out.append("🔗 <b>Join Us:</b>")
+            out.extend(f"📢 {e(c)}" for c in d["channels"])
         return "\n".join(out)
 
     def plain_len(c):
         return len(re.sub(r"<[^>]+>", "", html.unescape(c)))
 
-    for drop in [(), ("footer",), ("footer", "tagline"), ("footer", "tagline", "hashtags")]:
-        caption = render(drop)
-        if plain_len(caption) <= 1024:
-            return caption
-    return caption
+    text = render(desc)
+    over = plain_len(text) - 1024          # Telegram caption limit
+    if over > 0 and desc:
+        keep = len(desc) - over - 1
+        desc = desc[:keep].rstrip() + "…" if keep > 20 else ""
+        text = render(desc)
+    return text
+
+
+# ---------------------------------------------------------------- video info, thumbnail, AI
+async def _run(*cmd):
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await proc.communicate()
+        return proc.returncode, out.decode(errors="ignore")
+    except FileNotFoundError:
+        return 1, ""
+
+
+async def probe_video(p: Path):
+    """returns (duration_seconds, width, height); zeros if ffprobe is missing"""
+    rc, out = await _run("ffprobe", "-v", "error", "-select_streams", "v:0",
+                         "-show_entries", "stream=width,height:format=duration",
+                         "-of", "json", str(p))
+    try:
+        j = json.loads(out)
+        s = j["streams"][0]
+        return int(float(j["format"]["duration"])), int(s["width"]), int(s["height"])
+    except Exception:
+        return 0, 0, 0
+
+
+async def make_thumb(p: Path, duration: int):
+    """grab one frame at about 10% of the video, save as small JPEG"""
+    thumb = p.parent / "thumb.jpg"
+    ss = max(1, int(duration * 0.10)) if duration else 5
+    rc, _ = await _run("ffmpeg", "-y", "-ss", str(ss), "-i", str(p), "-frames:v", "1",
+                       "-vf", "scale=320:-2", "-q:v", "5", str(thumb))
+    return thumb if rc == 0 and thumb.exists() else None
+
+
+def _gemini_call(filename: str, thumb) -> dict:
+    prompt = (
+        "You write info for a Telegram movie channel post.\n"
+        f"File name: {filename}\n"
+        "A frame from the video is attached (if any).\n"
+        "Return JSON with these keys:\n"
+        "title: clean movie or series title only (no year, resolution, codec or release tags)\n"
+        "year: 4 digits, or '' if unknown\n"
+        "studio: production company, studio or platform; '' if you are not sure\n"
+        "description: 1 spoiler-free sentence, max 120 characters, in English. "
+        "If you do not recognise the film, write a generic teaser from the title and the mood "
+        "of the frame. Do not invent actors, characters or plot details.\n"
+    )
+    parts = [{"text": prompt}]
+    if thumb:
+        parts.append({"inline_data": {"mime_type": "image/jpeg",
+                                      "data": base64.b64encode(Path(thumb).read_bytes()).decode()}})
+    body = {"contents": [{"parts": parts}],
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.7}}
+    req = urllib.request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_KEY})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        res = json.load(r)
+    return json.loads(res["candidates"][0]["content"]["parts"][0]["text"])
+
+
+async def ai_meta(filename: str, thumb) -> dict:
+    if not GEMINI_KEY:
+        return {}
+    for attempt in range(2):                      # one retry, then give up
+        try:
+            j = await asyncio.to_thread(_gemini_call, filename, thumb)
+            out = {}
+            for k in ("title", "year", "studio", "description"):
+                v = str(j.get(k) or "").strip()
+                if v:
+                    out[k] = v
+            desc = out.get("description", "")
+            if len(desc) > 130:                   # keep it short even if the AI writes more
+                out["description"] = desc[:127].rsplit(" ", 1)[0].rstrip(" ,;:.") + "…"
+            return out
+        except Exception as ex:
+            print(f"AI caption failed for {filename} (try {attempt + 1}/2): {ex}", flush=True)
+            await asyncio.sleep(2)
+    return {}      # AI failed: post with file name info only (title, type, runtime, size, channels)
 
 
 # ---------------------------------------------------------------- web app
@@ -414,10 +447,28 @@ async def worker():
             job["pct"] = round(sent / total * 100, 1) if total else 0.0
 
         try:
-            caption = await asyncio.to_thread(build_caption, p, STATE["captions"].get(p.name, {}))
+            dur, w, h = await probe_video(p)
+            runtime = ""
+            if dur:
+                hh, r = divmod(dur, 3600)
+                mm, ss = divmod(r, 60)
+                runtime = f"{hh}h {mm:02d}m" if hh else f"{mm}m {ss:02d}s"
+            thumb = await make_thumb(p, dur)
+
+            job["status"] = "Writing caption (AI)"
+            meta = await ai_meta(p.name, thumb)
+            if parse_name(p.stem).get("year"):
+                meta.pop("year", None)                       # year from the file name wins
+            meta.update(STATE["captions"].get(p.name, {}))   # captions.json, if present, wins
+            caption = await asyncio.to_thread(build_caption, p, meta, runtime)
+            job["status"] = "uploading"
+            attrs = [DocumentAttributeVideo(duration=dur, w=w, h=h, supports_streaming=True)] if dur else None
+
             for attempt in range(5):
                 try:
                     await client.send_file(target, p, caption=caption, parse_mode="html",
+                                           thumb=str(thumb) if thumb else None,
+                                           attributes=attrs,
                                            supports_streaming=True, progress_callback=cb)
                     job["status"], job["pct"] = "done", 100.0
                     DONE_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -507,6 +558,8 @@ async def main():
         print(f"Open: https://<your-railway-domain>/?key={key}", flush=True)
     if not os.environ.get("KEY"):
         print("KEY variable not set, so this key changes at every restart. Set KEY in Railway Variables.", flush=True)
+    if not GEMINI_KEY:
+        print("GEMINI_API_KEY not set, captions will use the file name only.", flush=True)
     print("=" * 60, flush=True)
 
     server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="warning"))
